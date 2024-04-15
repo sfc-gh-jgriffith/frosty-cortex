@@ -1,32 +1,138 @@
+# Import python packages
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
 import streamlit as st 
 
 import re
 
-from snowflake.snowpark.session import Session 
-from snowflake.ml.utils import connection_params
 from snowflake.cortex import Complete
 
-from prompts import get_system_prompt, get_summary_prompt
+session = get_active_session()
 
-params = connection_params.SnowflakeLoginOptions("demo_jgriffith3")
+SCHEMA_PATH =  "FROSTY_SAMPLE.CYBERSYN_FINANCIAL"
+QUALIFIED_TABLE_NAME = f"{SCHEMA_PATH}.FINANCIAL_ENTITY_ANNUAL_TIME_SERIES"
+TABLE_DESCRIPTION = """
+This table has various metrics for financial entities (also referred to as banks) since 1983.
+The user may describe the entities interchangeably as banks, financial institutions, or financial entities.
+"""
+# This query is optional if running Frosty on your own table, especially a wide table.
+# Since this is a deep table, it's useful to tell Frosty what variables are available.
+# Similarly, if you have a table with semi-structured data (like JSON), it could be used to provide hints on available keys.
+# If altering, you may also need to modify the formatting logic in get_table_context() below.
+METADATA_QUERY = f"SELECT VARIABLE_NAME, DEFINITION FROM {SCHEMA_PATH}.FINANCIAL_ENTITY_ATTRIBUTES_LIMITED;"
 
-@st.cache_resource
-def get_snowflake_connection():
-    session = Session.builder.configs(params).create()
-    return session
+GEN_SQL = """
+You will be acting as an AI Snowflake SQL Expert named Frosty.
+Your goal is to give correct, executable sql query to users.
+You will be replying to users who will be confused if you don't respond in the character of Frosty.
+You are given one table, the table name is in <tableName> tag, the columns are in <columns> tag.
+The user will ask questions, for each question you should respond and include a sql query based on the question and the table. 
 
-session = get_snowflake_connection()
+{context}
+
+Here are 8 critical rules for the interaction you must abide:
+<rules>
+1. You MUST MUST wrap the generated sql code within ``` sql code markdown in this format e.g
+```sql
+(select 1) union (select 2)
+```
+2. If I don't tell you to find a limited set of results in the sql query or question, you MUST limit the number of responses to 10.
+3. Text / string where clauses must be fuzzy match e.g ilike %keyword%
+4. Make sure to generate a single snowflake sql code, not multiple. 
+5. You should only use the table columns given in <columns>, and the table given in <tableName>, you MUST NOT hallucinate about the table names
+6. DO NOT put numerical at the very front of sql variable.
+7. DO NOT include a semicolon at the end of the statement. 
+8. If the user asks you to group by a column, you should also order the data by that column. If year is present in the results, order by that.
+</rules>
+
+Don't forget to use "ilike %keyword%" for fuzzy match queries (especially for variable_name column)
+and wrap the generated sql code with ``` sql code markdown in this format e.g:
+```sql
+(select 1) union (select 2)
+```
+
+For each question from the user, make sure to include a query in your response.
+
+Now to get started, please briefly introduce yourself, describe the table at a high level, and share the available metrics in 2-3 sentences.
+Then provide 3 example questions using bullet points.
+"""
+
+@st.cache_data(show_spinner="Loading Frosty's context...")
+def get_table_context(_session, table_name: str, table_description: str, metadata_query: str = None):
+    table = table_name.split(".")
+    columns = _session.sql(f"""
+        SELECT COLUMN_NAME, DATA_TYPE FROM {table[0].upper()}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{table[1].upper()}' AND TABLE_NAME = '{table[2].upper()}'
+        """).collect()
+    
+    columns_str = "\n".join(
+        [
+            f"- **{c['COLUMN_NAME']}**: {c['DATA_TYPE']}"
+            for c in columns
+        ]
+    )
+    context = f"""
+Here is the table name <tableName> {table_name} </tableName>
+
+<tableDescription>{table_description}</tableDescription>
+
+Here are the columns of the {table_name} table
+
+<columns>\n\n{columns_str}\n\n</columns>
+    """
+    if metadata_query:
+        metadata = _session.sql(metadata_query).collect()
+        metadata_str = "\n".join(
+            [
+                f"- **{v['VARIABLE_NAME']}**: {v['DEFINITION']}"
+                for v in metadata
+            ]
+        )
+        context = context + f"\n\nAvailable variables by VARIABLE_NAME:\n\n{metadata_str}"
+    return context
+
+def get_system_prompt(_session):
+    table_context = get_table_context(
+        _session,
+        table_name=QUALIFIED_TABLE_NAME,
+        table_description=TABLE_DESCRIPTION,
+        metadata_query=METADATA_QUERY
+    )
+    return GEN_SQL.format(context=table_context)
+
+def get_summary_prompt(_session, data, context):
+    prompt = f"""
+        You are an assistant helping derive insights from a dataset containing metrics
+        for financial entities. The user asked this question:
+        
+        {context}
+
+        The returned data is below. Summarize the data and provide insights that will 
+        help the user understand the returned data. 
+        Be concise with no initial greetings or salutations. DO NOT include any SQL, provide 
+        a summary based only on the data provided. 
+
+        {data.to_string(index=False)}
+
+    """
+    return prompt
+
 st.title("☃️ Frosty")
 
-# Initialize the chat messages history
+
 
 with st.sidebar:
     if st.button("Start Over"):
         del st.session_state["messages"]
+
+    model_choices = ['mistral-large', 'llama2-70b-chat', 'mistral-7b', 'mixtral-8x7b', 'gemma-7b']
     
-    show_sql = st.checkbox("Show SQL", value=True)
+    model = st.selectbox("Select a model", model_choices)
 
+    show_work = st.checkbox("Show Work", value=True)
+    
 
+# Initialize the chat messages history
 if "messages" not in st.session_state:
     # system prompt includes table information, rules, and prompts the LLM to produce
     # a welcome message to the user.
@@ -43,32 +149,23 @@ for message in st.session_state.messages:
         continue
 
     with st.chat_message(message["role"]):
-        if show_sql or (message["role"] == "user") or (message_counter == 0):
+        if (message["role"] == "user" or show_work):
             st.write(message["content"])
         
-        # give option to get data summary from LLM
         if "results" in message:
-            st.dataframe(message["results"])
-            if st.button("Summarize", key=f"summarize_message_{message_counter}"):
-                
-                summary = Complete("mistral-large", 
-                                   get_summary_prompt(session, 
-                                                      data=message["results"], 
-                                                      context=message["content"]
-                                                     )
-                                 )
-                st.write(summary)
+            st.dataframe(message["results"], hide_index=True)
+
+        if "summary" in message:
+            st.write(message["summary"])
+
     message_counter += 1
 
 # If last message is not from assistant, we need to generate a new response
 if st.session_state.messages[-1]["role"] != "assistant":
     with st.chat_message("assistant"):
-        resp_container = st.empty()
         messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
         
-        response = Complete('mistral-large', str(messages))
-
-        resp_container.markdown(response)
+        response = Complete(model, str(messages))
 
         message = {"role": "assistant", "content": response}
         
@@ -81,11 +178,18 @@ if st.session_state.messages[-1]["role"] != "assistant":
                 
                 if sql[-1] == ';':
                     sql = sql[:-1]
+                
+                message["results"] = session.sql(sql).to_pandas()
 
-                message["results"] = session.sql(sql)
-                st.dataframe(message["results"])
-        
+                # summarize the data with the LLM. you could choose a different LLM than the 
+                # one that generates your SQL
+                message["summary"] = Complete(model, 
+                                              get_summary_prompt(session, 
+                                                  data=message["results"], 
+                                                  context=message["content"]
+                                                 )
+                                        )
+                
         st.session_state.messages.append(message)
-       
+        st.experimental_rerun()
 
-        
